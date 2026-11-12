@@ -22,12 +22,9 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         include:
-          - tag: v4.18.42
-            commit: 9335843246e3b7a17944861f3ac8731a259732c2
-            assets: 8
           - tag: v4.18.19
             commit: af07479351c5b974e72ae1c7183f2272e79ffc1c
             assets: 8
@@ -52,6 +49,29 @@ jobs:
         run: |
           set -Eeuo pipefail
           gh api "repos/${DESTINATION_REPO}/commits/${COMMIT_SHA}" --silent
+
+
+      # GitHub's release API can reject --target <old-sha> with GITHUB_TOKEN
+      # when older commits differ from main in .github/workflows.
+      - name: Restore historical Git tag when permitted
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if gh api "repos/${DESTINATION_REPO}/git/ref/tags/${VERSION}" \
+            --jq '.object.sha' > tag-sha.txt 2>/dev/null; then
+            existing=$(cat tag-sha.txt)
+            if [[ "$existing" != "$COMMIT_SHA" ]]; then
+              echo "::error::Existing version tag points to $existing rather than expected $COMMIT_SHA."
+              exit 1
+            fi
+            echo "HISTORICAL_TAG=true" >> "$GITHUB_ENV"
+          elif gh api --method POST "repos/${DESTINATION_REPO}/git/refs" \
+                 -f ref="refs/tags/${VERSION}" -f sha="$COMMIT_SHA" --silent; then
+            echo "HISTORICAL_TAG=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::GitHub token cannot create the historical Git tag. Release assets will be backed up under a tag at current main; see the original commit in the release notes."
+            echo "HISTORICAL_TAG=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Download upstream archive and expected asset manifest
         shell: bash
@@ -121,11 +141,21 @@ jobs:
           EOF
             gh api "repos/${SOURCE_REPO}/releases/tags/${VERSION}" \
               --jq '.body // ""' >> RELEASE_NOTES.md
-            gh release create "$VERSION" --repo "$DESTINATION_REPO" \
-              --target "$COMMIT_SHA" \
-              --title "NapCat $VERSION (unofficial archive)" \
-              --notes-file RELEASE_NOTES.md \
-              --latest=false
+            if [[ "$HISTORICAL_TAG" == "true" ]]; then
+              gh release create "$VERSION" --repo "$DESTINATION_REPO" \
+                --verify-tag \
+                --title "NapCat $VERSION (unofficial archive)" \
+                --notes-file RELEASE_NOTES.md \
+                --latest=false
+            else
+              echo "" >> RELEASE_NOTES.md
+              echo "**Git tag warning:** this Release tag points to the current main branch, not the historical source commit, because GitHub Actions denied tagging the old commit. For historical code, use the Source snapshot link above." >> RELEASE_NOTES.md
+              gh release create "$VERSION" --repo "$DESTINATION_REPO" \
+                --target main \
+                --title "NapCat $VERSION (unofficial archive)" \
+                --notes-file RELEASE_NOTES.md \
+                --latest=false
+            fi
           fi
 
       - name: Upload original assets and checksum manifest
