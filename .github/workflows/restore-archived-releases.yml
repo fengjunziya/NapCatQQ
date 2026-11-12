@@ -1,0 +1,150 @@
+name: Restore archived NapCat releases
+
+# Copy all currently available XingYunStar/NapCatQQ releases (including binary
+# assets) into this fork without rewriting its source history.
+on:
+  push:
+    paths:
+      - '.github/workflows/restore-archived-releases.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: napcat-release-archive-import
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    name: Restore ${{ matrix.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - tag: v4.18.42
+            commit: 9335843246e3b7a17944861f3ac8731a259732c2
+            assets: 8
+          - tag: v4.18.19
+            commit: af07479351c5b974e72ae1c7183f2272e79ffc1c
+            assets: 8
+          - tag: v4.17.23
+            commit: 5c04b799a6a93db812a6381f9c3b3ae58fa46e9f
+            assets: 6
+          - tag: v4.15.0
+            commit: 74b1da67d8ef98f6f022e96336aca3dc2192c1d3
+            assets: 8
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_REPO: XingYunStar/NapCatQQ
+      DESTINATION_REPO: ${{ github.repository }}
+      VERSION: ${{ matrix.tag }}
+      COMMIT_SHA: ${{ matrix.commit }}
+      EXPECTED_COUNT: ${{ matrix.assets }}
+
+    steps:
+      - name: Confirm original commit exists in this fork
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh api "repos/${DESTINATION_REPO}/commits/${COMMIT_SHA}" --silent
+
+      - name: Download upstream archive and expected asset manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p downloads
+          gh api "repos/${SOURCE_REPO}/releases/tags/${VERSION}" \
+            --jq '.assets[] | [.name, (.size | tostring)] | @tsv' > expected.tsv
+          count=$(wc -l < expected.tsv | tr -d ' ')
+          if [[ "$count" != "$EXPECTED_COUNT" ]]; then
+            echo "::error::Expected $EXPECTED_COUNT assets in source, got $count."
+            exit 1
+          fi
+          gh release download "$VERSION" --repo "$SOURCE_REPO" --dir downloads
+
+      - name: Check asset sizes and archive checksums
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          count=$(find downloads -maxdepth 1 -type f | wc -l | tr -d ' ')
+          if [[ "$count" != "$EXPECTED_COUNT" ]]; then
+            echo "::error::Expected $EXPECTED_COUNT files, downloaded $count."
+            exit 1
+          fi
+          while IFS=$'\t' read -r name size; do
+            if [[ ! -f "downloads/$name" ]]; then
+              echo "::error::Missing release file: $name"
+              exit 1
+            fi
+            actual=$(stat -c '%s' "downloads/$name")
+            if [[ "$actual" != "$size" ]]; then
+              echo "::error::Size mismatch for $name: $actual != $size"
+              exit 1
+            fi
+          done < expected.tsv
+          shopt -s nullglob
+          for checksum in downloads/*.tar.sha256; do
+            ( cd downloads && sha256sum --check --strict "$(basename "$checksum")" )
+          done
+          (
+            cd downloads
+            find . -maxdepth 1 -type f -printf '%f\0' |
+              sort -z |
+              xargs -0 -r sha256sum > SHA256SUMS.txt
+          )
+
+      - name: Create historical release if it does not exist
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if gh release view "$VERSION" --repo "$DESTINATION_REPO" >/dev/null 2>&1; then
+            echo "Existing release $VERSION found; will ensure assets are uploaded."
+          else
+            cat > RELEASE_NOTES.md <<EOF
+          Historical, **unofficial** copy of NapCat $VERSION.
+
+          - Binary archive: https://github.com/$SOURCE_REPO/releases/tag/$VERSION
+          - Source snapshot: https://github.com/$DESTINATION_REPO/commit/$COMMIT_SHA
+          - Release files have been copied without executing or rebuilding them.
+          - \`SHA256SUMS.txt\` records hashes calculated from the downloaded archive files.
+          - Third-party binaries are **not** authenticated or security-audited by this workflow.
+
+          ---
+
+          ## Original archived release notes
+
+          EOF
+            gh api "repos/${SOURCE_REPO}/releases/tags/${VERSION}" \
+              --jq '.body // ""' >> RELEASE_NOTES.md
+            gh release create "$VERSION" --repo "$DESTINATION_REPO" \
+              --target "$COMMIT_SHA" \
+              --title "NapCat $VERSION (unofficial archive)" \
+              --notes-file RELEASE_NOTES.md \
+              --latest=false
+          fi
+
+      - name: Upload original assets and checksum manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh release upload "$VERSION" downloads/* \
+            --repo "$DESTINATION_REPO" --clobber
+
+      - name: Verify uploaded filenames and file sizes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh api "repos/${DESTINATION_REPO}/releases/tags/${VERSION}" \
+            --jq '.assets[] | select(.name != "SHA256SUMS.txt") | [.name, (.size | tostring)] | @tsv' \
+            | sort > actual.tsv
+          sort expected.tsv > expected-sorted.tsv
+          diff -u expected-sorted.tsv actual.tsv
+          gh api "repos/${DESTINATION_REPO}/releases/tags/${VERSION}" \
+            --jq '[.assets[].name] | index("SHA256SUMS.txt") != null' \
+            | grep -qx true
+          echo "Successfully restored $VERSION"
